@@ -13,56 +13,96 @@ import argparse
 import threading
 import time
 import queue
+import numpy as np
 
 # import required library like Gstreamer and GstreamerRtspServer
 gi.require_version('Gst', '1.0')
 gi.require_version('GstRtspServer', '1.0')
 from gi.repository import Gst, GstRtspServer, GObject
 
-# Frame capture thread class
-class FrameCaptureThread(threading.Thread):
-    def __init__(self, rtsp_url, frame_queue, max_queue_size=30):
-        threading.Thread.__init__(self)
-        self.rtsp_url = rtsp_url
-        self.frame_queue = frame_queue
-        self.max_queue_size = max_queue_size
-        self.stopped = False
+class Video_Buffer:
+    def __init__(self, pipe="video1", appsink_name="video_sink"):
+        self._frame = None
+        self.video_source = f'rtspsrc location={pipe} latency=10'
+
+        self.video_codec = '! rtph264depay ! h264parse '  # 'application/x-rtp' 생략
+        # self.video_decode = f' ! videoscale ! video/x-raw,width=1920,height=1080 ! videoconvert ! video/x-raw,format=(string)BGR ! appsink name={appsink_name} emit-signals=true sync=false max-buffers=3 drop=true'
+        self.video_decode = f'! avdec_h264 ! videoscale ! video/x-raw,width=1920,height=1080 ! videoconvert ! video/x-raw,format=(string)BGR ! appsink name={appsink_name} emit-signals=true sync=false max-buffers=3 drop=true'
+
+        self.video_pipe = None
+        self.video_sink = None
+        self.appsink_name = appsink_name
+        self.run()
+
+    def start_gst(self, config=None):
+        if not config:
+            config = [
+                'videotestsrc ! decodebin',
+                '! videoconvert ! video/x-raw,format=(string)BGR ! appsink name={self.appsink_name}'
+            ]
+
+        command = ' '.join(config)
+        self.video_pipe = Gst.parse_launch(command)
+        self.video_pipe.set_state(Gst.State.PLAYING)
+        self.video_sink = self.video_pipe.get_by_name(self.appsink_name)
         
-    def run(self):
-        cap = cv2.VideoCapture(self.rtsp_url)
-        
-        if not cap.isOpened():
-            print(f"Error: Cannot open RTSP stream at {self.rtsp_url}")
+        if not self.video_sink:
+            print(f"Failed to get appsink named {self.appsink_name}")
             return
-            
-        print(f"Successfully connected to RTSP stream: {self.rtsp_url}")
         
-        while not self.stopped:
-            ret, frame = cap.read()
-            if ret:
-                # If queue is full, remove oldest frame
-                if self.frame_queue.qsize() >= self.max_queue_size:
-                    try:
-                        self.frame_queue.get_nowait()
-                    except queue.Empty:
-                        pass
-                
-                
-                self.frame_queue.put(frame)
-            else:
-                print("Failed to grab frame, attempting to reconnect...")
-                cap.release()
-                time.sleep(1)  # Wait before reconnecting
-                cap = cv2.VideoCapture(self.rtsp_url)
-                if not cap.isOpened():
-                    print(f"Reconnection failed to {self.rtsp_url}")
-                else:
-                    print(f"Reconnected to {self.rtsp_url}")
-        
-        cap.release()
-        
-    def stop(self):
-        self.stopped = True
+        self.video_sink.set_property("emit-signals", True)
+        self.video_sink.set_property("sync", False)
+
+    @staticmethod
+    def gst_to_opencv(sample):
+        buf = sample.get_buffer()
+        caps = sample.get_caps()
+        array = np.ndarray(
+            (
+                caps.get_structure(0).get_value('height'),
+                caps.get_structure(0).get_value('width'),
+                3
+            ),
+            buffer=buf.extract_dup(0, buf.get_size()), dtype=np.uint8)
+        return array
+
+    def read(self):
+        return self._frame is not None, self._frame
+
+    def isOpened(self):
+        return self._frame is not None
+
+    def run(self):
+        self.start_gst(
+            [
+                self.video_source,
+                self.video_codec,
+                # ' ! queue leaky=downstream max-size-buffers=10 ',
+                self.video_decode
+            ]
+        )
+        if self.video_sink:
+            self.video_sink.connect('new-sample', self.callback)
+
+        bus = self.video_pipe.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", self.on_message)
+
+    def on_message(self, bus, message):
+        t = message.type
+        if t == Gst.MessageType.ERROR or t == Gst.MessageType.EOS:
+            self.video_pipe.set_state(Gst.State.NULL)
+            self.run()
+
+    def callback(self, sink):
+        sample = sink.emit('pull-sample')
+        new_frame = self.gst_to_opencv(sample)
+        self._frame = new_frame
+
+        return Gst.FlowReturn.OK
+
+    def release(self):
+        self.video_pipe.set_state(Gst.State.NULL)
 
 # Sensor Factory class which inherits the GstRtspServer base class and add
 # properties to it.
@@ -128,36 +168,56 @@ class GstServer(GstRtspServer.RTSPServer):
         self.get_mount_points().add_factory(opt.stream_uri, self.factory)
         self.attach(None)
 
-# getting the required information from the user 
-parser = argparse.ArgumentParser()
-parser.add_argument("--port", default=8554, help="port to stream video", type=int)
-parser.add_argument("--stream_uri", default="/stream", help="rtsp video stream uri")
-parser.add_argument("--rtsp_source", default="rtsp://admin:admin@192.168.1.30/stream1", 
-                    help="source rtsp stream url")
-opt = parser.parse_args()
+if __name__ == "__main__":
+    # getting the required information from the user 
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", default=8554, help="port to stream video", type=int)
+    parser.add_argument("--stream_uri", default="/stream", help="rtsp video stream uri")
+    parser.add_argument("--rtsp_source", default="rtsp://admin:admin@192.168.1.30/stream1", 
+                        help="source rtsp stream url")
+    opt = parser.parse_args()
 
-# initializing the threads and running the stream on loop.
-GObject.threads_init()
-Gst.init(None)
+    # initializing the threads and running the stream on loop.
+    GObject.threads_init()
+    Gst.init(None)
 
-# Create a queue to hold frames between the capture thread and RTSP server
-frame_queue = queue.Queue(maxsize=30)  # 1 seconds buffer at 30fps
+    max_queue_size = 30
 
-# Start the frame capture thread
-capture_thread = FrameCaptureThread(opt.rtsp_source, frame_queue)
-capture_thread.daemon = True  # Thread will close when main program exits
-capture_thread.start()
+    # Create a queue to hold frames between the capture thread and RTSP server
+    frame_queue = queue.Queue(maxsize=max_queue_size)  # 1 seconds buffer at 30fps
+    video_buffer = Video_Buffer(pipe=opt.rtsp_source)
 
-# Start the RTSP server
-server = GstServer(frame_queue)
+    # Start the RTSP server
+    server = GstServer(frame_queue)
 
-try:
-    # Run the main loop
-    loop = GObject.MainLoop()
-    loop.run()
-except KeyboardInterrupt:
-    # Handle clean shutdown
-    print("Stopping capture thread...")
-    capture_thread.stop()
-    capture_thread.join(timeout=1.0)
-    print("Exiting...")
+    main_context = GObject.MainContext.default()
+    main_loop = GObject.MainLoop.new(main_context, False)
+
+    while True:
+        ret, frame = video_buffer.read()
+        if ret:
+            if frame_queue.qsize() >= max_queue_size:
+                try:
+                    frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
+
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
+
+            frame_queue.put(frame)
+
+            # cv2.imshow("test", frame)
+            # cv2.waitKey(1)
+
+        else:
+            print("Disconnect RTSP")
+            
+         # GObject 주기 실행
+        while main_context.pending():
+            main_context.iteration(False)
+
+        # 잠시 대기
+    
+     # 서버 종료
+    server.stop()
+    main_loop.quit()

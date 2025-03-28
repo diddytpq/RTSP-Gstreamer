@@ -11,7 +11,9 @@ if __name__ == '__main__':
     import cv2
 
     # pipe = "rtsp://admin:admin@192.168.1.30/stream1"
-    pipe = "rtsp://localhost:8554/stream"
+    # pipe = "rtsp://localhost:8554/stream"
+    pipe = "rtsp://192.168.0.208:554/stream"
+
 
 
     video = cv2.VideoCapture(pipe)
